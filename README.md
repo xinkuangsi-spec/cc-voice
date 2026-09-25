@@ -38,8 +38,9 @@ llama.cpp 从 [releases](https://github.com/ggml-org/llama.cpp/releases) 下 Win
 **显存按需占用**：llama-server 在第一次按下触发键时才启动（加载约 4 秒，和录音同时进行），
 闲置 10 分钟（面板可调）后自动退出，显存全部还回去。退出守护进程时也会一并关掉。
 
-做一个桌面快捷方式指向 `语音输入开关.cmd`，双击即可开关。想让它跟 Claude Code
-一起自动启动，再执行：
+做一个桌面快捷方式指向 `语音输入开关.cmd`（图标用 `tools\icon.ico`），双击即可开关。开机自启：在
+`shell:startup` 里放一个快捷方式，目标是 `.venv\Scripts\pythonw.exe` 加参数 `daemon\ccvoice.py`（不带
+`--announce`，开机时不弹提示）。想让它跟 Claude Code 一起自动启动，再执行：
 
 ```powershell
 claude plugin marketplace add "$env:USERPROFILE\.claude-voice\plugin"
