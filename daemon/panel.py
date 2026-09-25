@@ -202,9 +202,10 @@ def make_handler(app):
                     app.request_quit()
                 return self._send(200, json.dumps({"ok": True, "paused": app.paused}))
             if self.path == "/api/text":
-                (ROOT / "hotwords.txt").write_text(body.get("hotwords", ""), encoding="utf-8")
-                (ROOT / "rules.txt").write_text(body.get("rules", ""), encoding="utf-8")
-                (ROOT / "context.txt").write_text(body.get("context", ""), encoding="utf-8")
+                # 只写请求里带了的：别的 AI 按 voice-fix 技能只改一份时，别把另外两份清空
+                for key in ("hotwords", "rules", "context"):
+                    if isinstance(body.get(key), str):
+                        (ROOT / f"{key}.txt").write_text(body[key], encoding="utf-8")
                 app.fixer.reload()
                 app.context.reload()
                 return self._send(200, json.dumps({"ok": True}))
