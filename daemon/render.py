@@ -1,229 +1,309 @@
-"""用 Pillow 画灵动岛的每一帧。
+"""灵动岛的逐帧绘制，移植自 voice-dictate 的 Look（dictate.cs）。
 
-抗锯齿策略：胶囊轮廓这种曲线在 4 倍超采样下绘制再 LANCZOS 缩小，边缘变成
-平滑灰阶。文字交给 PIL 自带的字形抗锯齿，竖直的波形柱本身没有斜边。
+视觉取自 claude-directory 的 Lovable 输入框（3d-games/lovable-webgl-hero）：深色玻璃
+胶囊 + 三层投影 + 旋转渐变圆片；聆听时的音量条移植自 react-bits 的 SlicedWaves，
+「识别中…」的扫光移植自 react-bits 的 ShinyText。常量与 dictate.cs 一一对应，
+改动时两边对照着看。
 
-柔和感来自真实的高斯模糊投影 —— 只有拿到 alpha 通道才做得到，这也是从
-tkinter Canvas 换到分层窗口的主要动机。
-
-底板按「三段切片」生成：药丸在收起/展开之间变宽变窄，若按宽度缓存则每帧
-都是缓存未命中（超采样 + 高斯模糊约 10ms，撑不住 60fps）。胶囊的渐变只沿
-垂直方向，所以左帽 + 中段横向拉伸 + 右帽在数学上与重画完全等价，且 O(1)。
+性能：胶囊底板（投影 + 玻璃面 + 描边）只按最大宽度渲染一次，其它宽度用
+「左帽 + 中段拉伸 + 右帽」切出来 —— 渐变只沿垂直方向，切片与重画等价。
+每帧只画圆片、音量条和文字。
 """
 import math
 from functools import lru_cache
 
+import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
-# 乳白暖调
-PANEL_TOP = (255, 254, 252)
-PANEL_BOT = (246, 243, 237)
-BORDER = (255, 255, 255)
-TEXT = (40, 36, 30)
-MUTED = (126, 119, 107)
-CLAY = (192, 138, 110)
-SAGE = (140, 163, 132)
-AMBER = (210, 162, 76)
-BAR_BASE = (150, 140, 126)
+H = 48                      # 胶囊高度（96dpi 逻辑像素）
+M = 36                      # 四周透明留白，放投影
+CHIP_X, CHIP_R = 24, 16
+CONTENT_X, GAP, PAD_RIGHT = 52, 14, 20
+METER_W, METER_H, SLAT_GAP = 120, 26, 1.5
+TEXT_MAX = 560              # 识别结果最多显示这么宽，超出截断
+W_MAX = CONTENT_X + TEXT_MAX + PAD_RIGHT
+SS = 3                      # 圆片和音量条的超采样倍数
 
-LED_ON = (74, 190, 118)      # 绿：正在语音输入
-LED_IDLE = (214, 98, 80)     # 红：待机
-LED_OFF = (170, 164, 154)    # 灰：已暂停
+FONT_UI = (r"C:\Windows\Fonts\msyh.ttc", 1)          # Microsoft YaHei UI
+FONT_ICON = (r"C:\Windows\Fonts\SegoeIcons.ttf", 0)  # Segoe Fluent Icons
+MIC, CHECK, WARN = "\ue720", "\ue73e", "\ue7ba"
+TITLE_PX, HINT_PX, ICON_PX = 14, 12, 14
 
-# 225 是实测甜点：在 Claude Code 的深色终端上仍是乳白而非灰，文字可读，
-# 边缘与投影保持通透。低于 200 面板会被黑底压成中灰，深色文字失去对比度。
-PANEL_ALPHA = 225
-BORDER_ALPHA = 190
-SHADOW_ALPHA = 42
-SHADOW_BLUR = 9              # 逻辑像素
-SHADOW_DY = 3
-
-H = 34                       # 药丸高度（96dpi 逻辑像素）
-W_MAX = 320                  # 最宽形态，决定窗口画布尺寸
-BARS = 20
-
-FONT_CJK = r"C:\Windows\Fonts\msyhl.ttc"      # 微软雅黑 Light，细字重更清秀
-FONT_NUM = r"C:\Windows\Fonts\segoeui.ttf"
-SS = 4                                        # 曲线超采样倍数
+ORANGE, INDIGO = np.array([255, 102, 14]), np.array([100, 106, 237])
 
 
-@lru_cache(maxsize=8)
-def _font(path: str, px: int):
+@lru_cache(maxsize=16)
+def font(spec: tuple, px: int):
     try:
-        return ImageFont.truetype(path, px)
+        return ImageFont.truetype(spec[0], px, index=spec[1])
     except OSError:
         return ImageFont.load_default()
 
 
+def text_width(s: str, px: int) -> float:
+    return ImageDraw.Draw(Image.new("L", (1, 1))).textlength(s, font=font(FONT_UI, px))
+
+
+def width_for(kind: str, text: str, hint: str) -> float:
+    """各状态的胶囊宽度（逻辑像素），公式同 Look.WidthFor。"""
+    hint_w = text_width(hint, HINT_PX) if hint else 0
+    if kind == "listening":
+        return CONTENT_X + METER_W + GAP + hint_w + PAD_RIGHT
+    text_w = min(text_width(text, TITLE_PX), TEXT_MAX) if text else 0
+    if kind == "busy":
+        return CONTENT_X + text_w + GAP + hint_w + PAD_RIGHT
+    return CONTENT_X + text_w + PAD_RIGHT
+
+
+# ---------------------------------------------------------------- 底板
+def _capsule(w: int, h: int, inset: float = 0.0) -> Image.Image:
+    big = Image.new("L", (w * SS, h * SS), 0)
+    i = inset * SS
+    ImageDraw.Draw(big).rounded_rectangle([i, i, w * SS - 1 - i, h * SS - 1 - i],
+                                          radius=(h * SS - 2 * i) / 2, fill=255)
+    return big.resize((w, h), Image.LANCZOS)
+
+
+def _vgrad(h: int, stops: list) -> np.ndarray:
+    """垂直渐变，stops = [(位置, (r,g,b,a)), ...]，返回 h×4 的 float 数组。"""
+    ys = (np.arange(h) + 0.5) / h
+    pos = [p for p, _ in stops]
+    return np.stack([np.interp(ys, pos, [c[k] for _, c in stops]) for k in range(4)], 1)
+
+
 @lru_cache(maxsize=4)
-def _panel_full(w: int, h: int, blur: int, dy: int, alpha: int) -> tuple:
-    """按最大宽度渲染一次底板（投影 + 胶囊 + 描边），供切片拉伸复用。"""
-    pad = blur * 2 + abs(dy) + 2
-    cw, ch = w + pad * 2, h + pad * 2
+def _shell_full(scale: float) -> Image.Image:
+    w, h, m = round(W_MAX * scale), round(H * scale), round(M * scale)
+    cw, ch = w + 2 * m, h + 2 * m
+    mask = _capsule(w, h)
 
-    # 4 倍超采样画轮廓再缩小 —— 抗锯齿的来源
-    mask = Image.new("L", (w * SS, h * SS), 0)
-    ImageDraw.Draw(mask).rounded_rectangle(
-        [0, 0, w * SS - 1, h * SS - 1], radius=h * SS // 2, fill=255)
-    mask = mask.resize((w, h), Image.LANCZOS)
+    # Lovable 的三层投影，只落在胶囊外面
+    outside = ImageChops.invert(Image.new("L", (cw, ch), 0))
+    hole = Image.new("L", (cw, ch), 0)
+    hole.paste(mask, (m, m))
+    outside = ImageChops.subtract(outside, hole)
+    keep = np.ones((ch, cw))
+    for alpha, blur, dy in ((0.16, 8, 2), (0.14, 16, 6), (0.12, 24, 10)):
+        layer = Image.new("L", (cw, ch), 0)
+        layer.paste(mask, (m, m + round(dy * scale)))
+        layer = layer.filter(ImageFilter.GaussianBlur(blur * scale / 2))
+        keep *= 1 - alpha * np.asarray(layer) / 255
+    shadow_a = (1 - keep) * np.asarray(outside) / 255
+    canvas = np.zeros((ch, cw, 4))
+    canvas[..., 3] = shadow_a * 255
 
-    bw = max(1, round(SS * 1.1))
-    inner = Image.new("L", (w * SS, h * SS), 0)
-    ImageDraw.Draw(inner).rounded_rectangle(
-        [bw, bw, w * SS - 1 - bw, h * SS - 1 - bw],
-        radius=(h * SS - 2 * bw) // 2, fill=255)
-    ring = ImageChops.subtract(mask, inner.resize((w, h), Image.LANCZOS))
+    # 玻璃面：底色 + 垂直着色 + 上亮下暗的描边
+    def over(dst, rgba, where):
+        a = rgba[..., 3:4] / 255 * where[..., None]
+        out_a = a + dst[..., 3:4] / 255 * (1 - a)
+        rgb = (rgba[..., :3] * a + dst[..., :3] * (dst[..., 3:4] / 255) * (1 - a)) / np.maximum(out_a, 1e-6)
+        return np.concatenate([rgb, out_a * 255], -1)
 
-    # 垂直渐变：顶部近乎纯白，底部落到米白，模拟柔光从上方漫射
-    grad = Image.new("RGB", (1, h))
-    for i in range(h):
-        t = (i / max(1, h - 1)) ** 0.8
-        grad.putpixel((0, i), tuple(round(PANEL_TOP[c] + (PANEL_BOT[c] - PANEL_TOP[c]) * t)
-                                    for c in range(3)))
-    panel = grad.resize((w, h)).convert("RGBA")
-    panel.putalpha(mask.point(lambda v: v * alpha // 255))
+    body = np.zeros((h, w, 4))
+    body = over(body, np.broadcast_to(np.array([43, 38, 38, 171.0]), (h, w, 4)), np.ones((h, w)))
+    tint = _vgrad(h, [(0, (118, 100, 50, 59)), (0.6634, (53, 53, 56, 179)), (1, (38, 38, 39, 179))])
+    body = over(body, np.broadcast_to(tint[:, None, :], (h, w, 4)), np.ones((h, w)))
+    body[..., 3] *= np.asarray(mask) / 255
+    ring = np.asarray(ImageChops.subtract(mask, _capsule(w, h, inset=scale))) / 255
+    rim = _vgrad(h, [(0, (255, 255, 255, 82)), (1, (255, 255, 255, 13))])
+    body = over(body, np.broadcast_to(rim[:, None, :], (h, w, 4)), ring)
 
-    # 描边上半段更亮，做出玻璃弧面被顶光扫到的感觉
-    edge = Image.new("RGBA", (w, h), BORDER + (0,))
-    fade = Image.new("L", (1, h))
-    for i in range(h):
-        fade.putpixel((0, i), round(BORDER_ALPHA * (1.0 - 0.55 * (i / max(1, h - 1)))))
-    edge.putalpha(ImageChops.multiply(ring, fade.resize((w, h))))
-    panel.alpha_composite(edge)
-
-    canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
-    shadow = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
-    shadow.paste((0, 0, 0, SHADOW_ALPHA), (pad, pad + dy), mask)
-    canvas.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(blur)))
-    canvas.alpha_composite(panel, (pad, pad))
-    return canvas, pad
+    canvas[m:m + h, m:m + w] = over(canvas[m:m + h, m:m + w], body, np.ones((h, w)))
+    return Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8), "RGBA")
 
 
-def panel_for(w: int, h: int, blur: int, dy: int, alpha: int) -> tuple:
-    """任意宽度的底板：左帽 + 中段横向拉伸 + 右帽。返回 (图像, 内边距)。"""
-    full, pad = _panel_full(W_MAX_PX(h), h, blur, dy, alpha)
-    cap = pad + h // 2 + 1                     # 帽子宽度：留白 + 半圆
-    if w >= full.width - pad * 2:
-        return full.copy(), pad
-    out_w = w + pad * 2
+def shell(width: float, scale: float) -> Image.Image:
+    full = _shell_full(scale)
+    m, h = round(M * scale), round(H * scale)
+    w = max(h, round(width * scale))
+    if w >= full.width - 2 * m:
+        return full.copy()
+    cap = m + h // 2 + 1
+    out_w = w + 2 * m
     out = Image.new("RGBA", (out_w, full.height), (0, 0, 0, 0))
     out.paste(full.crop((0, 0, cap, full.height)), (0, 0))
-    out.paste(full.crop((full.width - cap, 0, full.width, full.height)),
-              (out_w - cap, 0))
-    mid_w = out_w - cap * 2
-    if mid_w > 0:
-        # 中段取真实的一小条再拉伸，而不是取 1 像素 —— 1 像素在 LANCZOS 下
-        # 会把边缘的半透明像素也拉开，中段会出现一道竖向色带
+    out.paste(full.crop((full.width - cap, 0, full.width, full.height)), (out_w - cap, 0))
+    if out_w - 2 * cap > 0:
         strip = full.crop((cap, 0, cap + 8, full.height))
-        out.paste(strip.resize((mid_w, full.height), Image.BILINEAR), (cap, 0))
-    return out, pad
+        out.paste(strip.resize((out_w - 2 * cap, full.height), Image.BILINEAR), (cap, 0))
+    return out
 
 
-def W_MAX_PX(h: int) -> int:
-    """最大宽度按高度等比推出，保证 _panel_full 只有一份缓存。"""
-    return round(W_MAX * h / H)
+# ---------------------------------------------------------------- 圆片
+def _conic_color(deg: np.ndarray) -> np.ndarray:
+    """Lovable 发送键的锥形光环：透明白 -> 白 -> #9EC7FF -> 透明。"""
+    white, blue = np.array([255, 255, 255, 0.0]), np.array([158, 199, 255, 0.0])
+    t1 = np.clip(deg / 60, 0, 1)[..., None]
+    t2 = np.clip((deg - 60) / 60, 0, 1)[..., None]
+    t3 = np.clip((deg - 120) / 80, 0, 1)[..., None]
+    rgb = np.where(deg[..., None] < 60, white[:3], np.where(deg[..., None] < 120,
+                   white[:3] + (blue[:3] - white[:3]) * t2, blue[:3]))
+    a = np.where(deg < 60, t1[..., 0], np.where(deg < 120, 1.0, 1 - t3[..., 0])) * 255
+    return np.concatenate([rgb, a[..., None]], -1)
 
 
-class Frame:
-    """一帧的绘制上下文。坐标全是物理像素，缩放由调用方乘进 scale。"""
-
-    def __init__(self, scale: float, width: float, alpha: int = PANEL_ALPHA):
-        self.s = scale
-        self.h = round(H * scale)
-        self.w = max(self.h, round(width * scale))
-        base, pad = panel_for(self.w, self.h,
-                              max(2, round(SHADOW_BLUR * scale)),
-                              round(SHADOW_DY * scale), alpha)
-        self.img = base
-        self.pad = pad
-        self.d = ImageDraw.Draw(self.img)
-        self.left = pad
-        self.right = pad + self.w
-        self.cy = pad + self.h / 2
-
-    # ------------------------------------------------------------ 图元
-    def led(self, x, y, color, radius, glow=1.0):
-        """状态灯：外圈柔光 + 实心点。glow 控制呼吸强度。"""
-        r = radius
-        if glow > 0.02:
-            g = Image.new("RGBA", self.img.size, (0, 0, 0, 0))
-            ImageDraw.Draw(g).ellipse(
-                [x - r * 3.0, y - r * 3.0, x + r * 3.0, y + r * 3.0],
-                fill=color + (round(95 * glow),))
-            self.img.alpha_composite(g.filter(ImageFilter.GaussianBlur(r * 1.1)))
-        self._aa_ellipse(x, y, r, color)
-
-    def _aa_ellipse(self, x, y, r, color):
-        """小圆单独超采样：直接画会有明显锯齿，而它正是视线落点。"""
-        box = max(4, math.ceil(r * 2) + 4)
-        tile = Image.new("L", (box * SS, box * SS), 0)
-        c = box * SS / 2
-        ImageDraw.Draw(tile).ellipse([c - r * SS, c - r * SS, c + r * SS, c + r * SS],
-                                     fill=255)
-        solid = Image.new("RGBA", (box, box), color + (255,))
-        solid.putalpha(tile.resize((box, box), Image.LANCZOS))
-        self.img.alpha_composite(solid, (round(x - box / 2), round(y - box / 2)))
-
-    def bars(self, x, y, width, levels, room):
-        """竖直圆头细条。竖边无斜率，不需要抗锯齿处理。"""
-        bw = max(2.0, 2.0 * self.s)
-        gap = (width - BARS * bw) / max(1, BARS - 1)
-        for i, lv in enumerate(levels[-BARS:]):
-            bx = x + i * (bw + gap)
-            bh = max(bw / 2, (lv ** 0.55) * room)   # 开方压缩：小音量也看得见起伏
-            t = i / max(1, BARS - 1)
-            col = tuple(round(BAR_BASE[c] + (CLAY[c] - BAR_BASE[c]) * t * 0.65)
-                        for c in range(3))
-            self.d.rounded_rectangle([bx, y - bh, bx + bw, y + bh],
-                                     radius=bw / 2, fill=col + (225,))
-
-    def dots(self, x, y, n, phase):
-        """待机态的极简省略号，暗示「在听着」而不喧宾夺主。"""
-        r = 1.5 * self.s
-        for i in range(n):
-            a = 0.35 + 0.4 * (0.5 + 0.5 * math.sin(phase - i * 0.9))
-            self._aa_ellipse(x + i * r * 4, y, r,
-                             tuple(round(BAR_BASE[c] + (255 - BAR_BASE[c]) * (1 - a))
-                                   for c in range(3)))
-
-    def arc(self, x, y, r, phase):
-        box = max(8, math.ceil(r * 2) + 6)
-        tile = Image.new("RGBA", (box * SS, box * SS), (0, 0, 0, 0))
-        td = ImageDraw.Draw(tile)
-        c = box * SS / 2
-        for i in range(8):                    # 段数够多才读得出是转圈而不是一撇
-            td.arc([c - r * SS, c - r * SS, c + r * SS, c + r * SS],
-                   start=phase - i * 26, end=phase - i * 26 + 20,
-                   fill=CLAY + (round(235 - i * 26),),
-                   width=max(SS, round(2.0 * self.s * SS)))
-        self.img.alpha_composite(tile.resize((box, box), Image.LANCZOS),
-                                 (round(x - box / 2), round(y - box / 2)))
-
-    def check(self, x, y, u):
-        box = math.ceil(u * 2) + 8
-        tile = Image.new("RGBA", (box * SS, box * SS), (0, 0, 0, 0))
-        c = box * SS / 2
-        ImageDraw.Draw(tile).line(
-            [c - u * SS, c, c - u * SS * 0.15, c + u * SS * 0.85, c + u * SS, c - u * SS * 0.9],
-            fill=SAGE + (255,), width=max(SS, round(1.8 * self.s * SS)), joint="curve")
-        self.img.alpha_composite(tile.resize((box, box), Image.LANCZOS),
-                                 (round(x - box / 2), round(y - box / 2)))
-
-    def text(self, x, y, s, color, px, anchor="lm", font=FONT_CJK, maxw=None):
-        f = _font(font, px)
-        if maxw:
-            while s and self.d.textlength(s, font=f) > maxw:
-                s = s[:-1]
-                if self.d.textlength(s + "…", font=f) <= maxw:
-                    s += "…"
-                    break
-        self.d.text((x, y), s, font=f, fill=color + (255,), anchor=anchor)
-
-    def measure(self, s, px, font=FONT_CJK) -> float:
-        return self.d.textlength(s, font=_font(font, px))
+CHIP_BOX = 44                # 圆片小图的边长（逻辑像素），留出外圈和光环
 
 
-def text_width(s: str, px: int, font: str = FONT_CJK) -> float:
-    """不建帧就量文字宽度，用于决定药丸该展开到多宽。"""
-    probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
-    return probe.textlength(s, font=_font(font, px))
+def _rgba(rgb, alpha: np.ndarray) -> Image.Image:
+    h, w = alpha.shape
+    arr = np.empty((h, w, 4), np.uint8)
+    arr[..., :3] = rgb
+    arr[..., 3] = np.clip(alpha, 0, 255)
+    return Image.fromarray(arr, "RGBA")
+
+
+@lru_cache(maxsize=8)
+def _chip_parts(kind: str, scale: float) -> dict:
+    """圆片里不随时间变化的部分，每个缩放比例只算一次：超采样画好再缩小。"""
+    size = round(CHIP_BOX * scale)
+    n, u = size * SS, scale * SS
+    ys, xs = (np.mgrid[0:n, 0:n] + 0.5 - n / 2) / u
+    d = np.hypot(xs, ys)
+    r = CHIP_R
+
+    def down(rgb, alpha):
+        return _rgba(rgb, alpha * 255).resize((size, size), Image.LANCZOS)
+
+    parts = {"size": size}
+    if kind == "message":
+        parts["under"] = down((111, 111, 111), (d <= r) * 38 / 255)
+    else:
+        parts["under"] = down((95, 126, 167), (d <= 20) * 38 / 255)
+        parts["disc"] = Image.fromarray(((d <= r) * 255).astype(np.uint8)).resize((size, size), Image.LANCZOS)
+        over = down((173, 208, 255), (d <= r) * np.clip((d / r - 0.55) / 0.45, 0, 1) * 51 / 255)
+        over.alpha_composite(down((222, 236, 255), (np.abs(d - (r - 1.5)) <= 0.75) * np.interp(ys, [-r, r], [204, 0]) / 255))
+        over.alpha_composite(down((158, 199, 255), (np.abs(d - (r - 0.5)) <= 0.5) * 1.0))
+        parts["over"] = over
+        fy, fx = (np.mgrid[0:size, 0:size] + 0.5 - size / 2) / scale      # 最终尺寸上的坐标
+        parts["xy"] = (fx, fy)
+        parts["ring"] = np.asarray(Image.fromarray(((np.abs(d - 18) <= 1) * 255).astype(np.uint8))
+                                   .resize((size, size), Image.LANCZOS)) / 255
+        parts["phi"] = np.degrees(np.arctan2(fy, fx))
+    return parts
+
+
+@lru_cache(maxsize=8)
+def _glyph(kind: str, scale: float) -> Image.Image:
+    size = round(CHIP_BOX * scale)
+    glyph = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    ch = {"message": WARN, "notice": CHECK}.get(kind, MIC)
+    color = (254, 123, 2, 255) if kind == "message" else (255, 255, 255, 255)
+    ImageDraw.Draw(glyph).text((size / 2, size / 2), ch, font=font(FONT_ICON, round(ICON_PX * scale)),
+                               fill=color, anchor="mm")
+    return glyph
+
+
+def chip(kind: str, scale: float, t: float, state_t: float) -> Image.Image:
+    """以圆片中心为中心的 RGBA 小图。每帧只算旋转渐变（4s 一圈）和识别中的光环。"""
+    p = _chip_parts("message" if kind == "message" else "chip", scale)
+    im = p["under"].copy()
+    if kind != "message":
+        fx, fy = p["xy"]
+        ang = math.radians(t / 4.0 % 1.0 * 360.0 - 90)
+        c, s = math.cos(ang), math.sin(ang)
+        k = np.clip(0.5 + (fx * c + fy * s) / (2 * CHIP_R * (abs(c) + abs(s))), 0, 1)[..., None]
+        im.alpha_composite(_rgba(ORANGE + (INDIGO - ORANGE) * k, np.asarray(p["disc"], float)))
+        im.alpha_composite(p["over"])
+        if kind == "busy":
+            rot = state_t / 1.5 % 1.0 * 360.0
+            phi = (p["phi"] - (rot - 90)) % 360
+            col = _conic_color(phi)
+            im.alpha_composite(_rgba(col[..., :3], p["ring"] * (phi < 200) * col[..., 3]))
+    im.alpha_composite(_glyph(kind, scale))
+    return im
+
+
+# ---------------------------------------------------------------- 音量条
+def meter(scale: float, t: float, level: float) -> Image.Image:
+    """react-bits SlicedWaves 单行版：每一列的横条沿正弦起伏，起伏幅度跟着音量，
+    安静时是一条平静的线。"""
+    columns, thickness, speed, spread = 20, 0.14, 3.2, 0.9
+    c1, c2, c3 = np.array([160, 228, 255]), np.array([156, 164, 251]), np.array([255, 102, 244])
+    u = scale * SS
+    w, h = round(METER_W * u), round(METER_H * u)
+    im = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    glow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    dc, dg = ImageDraw.Draw(im), ImageDraw.Draw(glow)
+    travel = 0.10 + 0.90 * level
+    start, end = (0.5 - thickness / 2) * travel, (-0.5 + thickness / 2) * travel
+    cell, th = METER_W / columns, thickness * METER_H
+    for i in range(columns):
+        mv = math.sin(t * speed + i * spread + 1.0) * 0.5 + 0.5
+        cy = METER_H / 2 + (start + (end - start) * mv) * METER_H
+        col = c2 + (c1 - c2) * mv
+        col = col + (c3 - col) * ((i + 0.5) / columns * 0.45)
+        rgb = tuple(int(v) for v in col)
+        left, right = i * cell + SLAT_GAP / 2, (i + 1) * cell - SLAT_GAP / 2
+        dg.rectangle([left * u, (cy - th / 2 - 2.5) * u, right * u, (cy + th / 2 + 2.5) * u], fill=rgb + (46,))
+        dc.rectangle([left * u, (cy - th / 2) * u, right * u, (cy + th / 2) * u], fill=rgb + (242,))
+    glow.alpha_composite(im)
+    return glow.resize((round(METER_W * scale), round(METER_H * scale)), Image.LANCZOS)
+
+
+# ---------------------------------------------------------------- 文字
+def label(img: Image.Image, x: float, cy: float, s: str, px: int, alpha: int, maxw=None):
+    f = font(FONT_UI, px)
+    d = ImageDraw.Draw(img)
+    if maxw and d.textlength(s, font=f) > maxw:
+        while s and d.textlength(s + "…", font=f) > maxw:
+            s = s[:-1]
+        s += "…"
+    d.text((x, cy), s, font=f, fill=(255, 255, 255, alpha), anchor="lm")
+    return d.textlength(s, font=f)
+
+
+def shiny(img: Image.Image, x: float, cy: float, s: str, px: int, state_t: float) -> float:
+    """react-bits ShinyText：120deg 渐变 #b5b5b5 -> #fff(50%) -> #b5b5b5，每 2s 扫过一次。"""
+    f = font(FONT_UI, px)
+    tw = ImageDraw.Draw(img).textlength(s, font=f)
+    mask = Image.new("L", img.size, 0)
+    ImageDraw.Draw(mask).text((x, cy), s, font=f, fill=255, anchor="lm")
+    x0, y0, x1, y1 = mask.getbbox() or (0, 0, 1, 1)
+    ys, xs = np.mgrid[y0:y1, x0:x1].astype(float)
+    p = state_t / 2.0 % 1.0
+    band_x = x - tw * (1.5 - 2 * p)
+    ang = math.radians(30)
+    span = 2 * tw * math.cos(ang) + (y1 - y0) * math.sin(ang)
+    k = (((xs - band_x) * math.cos(ang) + (ys - y0) * math.sin(ang)) / max(span, 1)) % 1.0
+    white = np.interp(k, [0, 0.35, 0.5, 0.65, 1], [0, 0, 1, 0, 0])
+    v = 181 + (255 - 181) * white
+    rgba = np.stack([v, v, v, np.asarray(mask)[y0:y1, x0:x1]], -1).astype(np.uint8)
+    img.alpha_composite(Image.fromarray(rgba, "RGBA"), (x0, y0))
+    return tw
+
+
+def clip_to(img: Image.Image, width: float, scale: float) -> Image.Image:
+    """宽度动画期间内容可能伸出胶囊，按胶囊形状裁掉。只用在内容层上，
+    底板的投影本来就在胶囊外面。"""
+    m, h = round(M * scale), round(H * scale)
+    w = max(h, round(width * scale))
+    mask = Image.new("L", img.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle([m, m, m + w - 1, m + h - 1], radius=h / 2, fill=255)
+    img.putalpha(ImageChops.multiply(img.getchannel("A"), mask))
+    return img
+
+
+# ---------------------------------------------------------------- 整帧
+def frame(kind: str, text: str, hint: str, width: float, scale: float,
+          t: float, state_t: float, level: float) -> Image.Image:
+    """kind: listening / busy / notice / message，对应 dictate.cs 的 Kind。"""
+    img = shell(width, scale)
+    m = M * scale
+    cy = m + H * scale / 2
+    content = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    c = chip(kind, scale, t, state_t)
+    content.alpha_composite(c, (round(m + CHIP_X * scale - c.width / 2), round(cy - c.height / 2)))
+    x = m + CONTENT_X * scale
+    title, hint_px = round(TITLE_PX * scale), round(HINT_PX * scale)
+    if kind == "listening":
+        mt = meter(scale, t, level)
+        content.alpha_composite(mt, (round(x), round(cy - mt.height / 2)))
+        label(content, x + (METER_W + GAP) * scale, cy, hint, hint_px, 128)
+    elif kind == "busy":
+        w = shiny(content, x, cy, text, title, state_t)
+        label(content, x + w + GAP * scale, cy, hint, hint_px, 128)
+    else:
+        label(content, x, cy, text, title, 235, maxw=TEXT_MAX * scale)
+    img.alpha_composite(clip_to(content, width, scale))
+    return img

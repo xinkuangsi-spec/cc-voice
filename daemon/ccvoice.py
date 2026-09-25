@@ -24,11 +24,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import audio
 import config
 import inject
+import tuning
 import winapi
 from context import Context
 from gate import SessionGate
 from hud import Hud
 from textfix import TextFixer
+from tray import Tray
 from trigger import Trigger
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -58,7 +60,7 @@ def single_instance(name: str = MUTEX_NAME) -> bool:
 
 
 class App:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, announce: bool = False):
         self.cfg = cfg
         self.status = "启动中"
         self.recognizer = None
@@ -70,10 +72,7 @@ class App:
         self.gate = SessionGate(ROOT / "sessions", cfg["gate_mode"])
         self.gate.start()                    # 后台每秒重扫进程树，见 gate.start()
         self.fixer = TextFixer(ROOT / "rules.txt")
-        self.context = Context(ROOT / "context.txt", ROOT / "hotwords.txt",
-                               cfg["context"]["recent"])
-        for row in _last_history(cfg["context"]["recent"]):
-            self.context.remember(row)
+        self.context = Context(ROOT / "context.txt", ROOT / "hotwords.txt")
         self.last_context = ""
         self._cancel = False
         self.recorder = audio.Recorder(device=cfg["audio"]["device"])
@@ -85,14 +84,18 @@ class App:
         self._quit = False
 
         winapi.set_dpi_aware()
+        # 建 tk 窗口的那一刻前台就会被本进程抢走，所以要在那之前记下原来的窗口
+        self._fg_before = winapi.user32.GetForegroundWindow()
         self.root = tk.Tk()
         self.root.withdraw()
         self.hud = Hud(self.root, cfg["hud"].get("opacity", 0.95),
                        position=cfg["hud"].get("position"),
                        on_move=self._save_position,
                        on_double_click=self.open_panel)
-        if cfg["hud"]["enabled"]:
-            self.root.after(200, self._show_idle)
+        self._hud_seq = 0                 # 每次换状态 +1，过期的「稍后收起」据此作废
+        self.root.after(200, lambda: self._prime_overlay(announce))
+        self.tray = Tray(self)
+        self.tray.start()
 
         threading.Thread(target=self._load_model, name="model", daemon=True).start()
         self.trigger = Trigger(cfg, self._gate,
@@ -111,20 +114,27 @@ class App:
 
     def set_paused(self, on: bool):
         self.paused = self.hud.paused = bool(on)
+        self.tray.refresh()
 
     def request_quit(self):
         """由面板线程调用：只置标志，真正退出交给主线程 —— 从 HTTP 线程直接
         关 tkinter 会重现之前那个静默崩溃。"""
         self._quit = True
 
-    def _show_idle(self):
-        """首次显示灵动岛，并把焦点还给原来的窗口。
+    def _prime_overlay(self, announce: bool):
+        """启动时先让浮窗出现一次，再把焦点还给原来的窗口。
 
-        实测首次 ShowWindow 会让本进程拿到前台（之后就不会再抢了）。不还回去
-        的话，用户正在打字的窗口会突然失焦。
+        实测建 tk 窗口和首次 ShowWindow 都会让本进程拿到前台（之后就不会再抢了）。浮窗待机时
+        是隐藏的，不在这里先「烧掉」这一次，第一次按键说话时焦点就会被抢走，
+        文字贴不进终端。从快捷方式启动（--announce）时顺便提示一下已启动。
         """
-        before = winapi.user32.GetForegroundWindow()
-        self.hud.show("idle")
+        before = self._fg_before
+        if announce and self.cfg["hud"]["enabled"]:
+            self._ui("done", "语音输入已启动", hide_after=1500)
+            self._pump_once()
+        else:
+            winapi.user32.ShowWindow(self.hud.hwnd, 4)
+            winapi.user32.ShowWindow(self.hud.hwnd, 0)
         if before and winapi.user32.GetForegroundWindow() != before:
             winapi.user32.SetForegroundWindow(before)
 
@@ -183,7 +193,13 @@ class App:
             return
         self.record_t0 = time.time()
         self._cancel = False
-        self.recorder.start()
+        try:
+            self.recorder.start()
+        except Exception as e:                     # 同 voice-dictate：打不开就直说，别干等
+            self._record(0, 0, skipped=f"麦克风打不开：{e}")
+            self._ui("blocked", "麦克风打不开：" + audio.device_name(self.recorder.device),
+                     hide_after=3000)
+            return
         self.recognizer.warm()                     # 模型加载藏在录音时间里
         self._ui("listening", "0:00")
 
@@ -202,31 +218,33 @@ class App:
             return
         if peak < self.cfg["min_level"]:
             self._record(dur, peak, skipped="没听到说话（音量 %.3f）" % peak)
-            self._ui("blocked", "没听到说话", hide_after=1100)
+            self._ui("blocked", "没听到声音，检查「%s」是否静音"
+                     % audio.device_name(self.recorder.device), hide_after=4000)
             return
 
         self._ui("thinking")
+        rid = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        tuning.save_audio(rid, samples)            # 调教台拿原声重新识别用
         ctx = self.context.build() if self.cfg["context"]["enabled"] else ""
         self.last_context = ctx
         _, raw, ms = self.recognizer.transcribe(samples, ctx)
         text = self.fixer.apply(raw)
         if self._cancel:                           # 识别途中按了 Esc：结果作废
             self._cancel = False
-            self._record(dur, peak, raw=raw, ms=ms, skipped="已取消")
+            self._record(dur, peak, raw=raw, ms=ms, skipped="已取消", rid=rid)
             return
         if not text:
-            self._record(dur, peak, raw=raw, ms=ms, skipped="没有识别到内容")
+            self._record(dur, peak, raw=raw, ms=ms, skipped="没有识别到内容", rid=rid)
             self._ui("blocked", "没有识别到内容", hide_after=900)
             return
 
         inject.paste_text(text, self.cfg["inject"]["method"],
                           self.cfg["inject"]["restore_clipboard_ms"],
                           self.cfg["inject"]["auto_enter"])
-        self._record(dur, peak, raw=raw, text=text, ms=ms)
-        self.context.remember(text)
+        self._record(dur, peak, raw=raw, text=text, ms=ms, rid=rid)
         self._ui("done", text, hide_after=self.cfg["hud"]["done_ms"])
 
-    def _record(self, dur, peak, raw="", text="", ms=0.0, skipped=""):
+    def _record(self, dur, peak, raw="", text="", ms=0.0, skipped="", rid=""):
         """写两份：给面板的结构化数据，和给人扫的对齐流水。
 
         两种读者要的东西不一样 —— 面板要能解析，人要能一眼看出哪条没上屏、
@@ -238,7 +256,7 @@ class App:
             self.stats["last"] = text
 
         now = datetime.now()
-        row = {"ts": now.isoformat(timespec="seconds"),
+        row = {"id": rid, "ts": now.isoformat(timespec="seconds"),
                "raw": raw, "text": text, "skipped": skipped,
                "audio_s": round(dur, 2), "peak": round(peak, 3),
                "infer_ms": round(ms * 1000)}
@@ -271,68 +289,59 @@ class App:
     def _ui(self, state, text="", hide_after=0):
         self.ui_q.put((state, text, hide_after))
 
-    def _hide_later(self, ms):
-        """回到待机态而不是消失 —— 灵动岛常驻，红灯表示在候命。"""
-        self.ui_q.put((None, "", ms))
-
     def _save_position(self, origin):
         """由钩子线程调用：只记下待办，落盘交给主线程 —— 低级钩子回调里
         做文件 I/O 会拖慢整个系统的输入响应。"""
         self._pending_pos = list(origin)
 
     def _idle_state(self):
-        return "idle" if self.cfg["hud"]["enabled"] else "hidden"
+        return "hidden"
 
     def open_panel(self):
         import webbrowser
         webbrowser.open(f"http://127.0.0.1:{self.cfg['panel_port']}/")
 
-    def _pump(self):
-        """tkinter 侧的每帧工作：排空 UI 队列、喂波形、刷计时、落盘位置。"""
+    def _pump_once(self):
+        """排空 UI 队列、喂音量、刷计时、落盘位置。"""
         while True:
             try:
                 state, text, hide_after = self.ui_q.get_nowait()
             except queue.Empty:
                 break
-            if state is not None:
-                self.hud.show(state, text)
+            if not self.cfg["hud"]["enabled"]:
+                continue
+            self._hud_seq += 1
+            self.hud.show(state, text)
             if hide_after:
-                self.root.after(hide_after, lambda: self.hud.show(self._idle_state()))
+                # 只收起自己这一次显示的状态：期间又按下了触发键，就别把新的聆听收掉
+                seq = self._hud_seq
+                self.root.after(hide_after, lambda: seq == self._hud_seq
+                                and self.hud.show(self._idle_state()))
 
         if self.hud.state == "listening":
-            self.hud.set_level(self.recorder.level)
+            self.hud.set_level(self.recorder.rms)
             el = time.time() - self.record_t0
             self.hud.text = "%d:%02d" % (int(el // 60), int(el % 60))
 
-        if self._quit:
-            self.root.quit()
-            return
         if self._pending_pos is not None:
             self.cfg["hud"]["position"], self._pending_pos = self._pending_pos, None
             config.save(self.cfg)
-        self.root.after(33, self._pump)
+
+    def _pump(self):
+        self._pump_once()
+        if self._quit:
+            self.root.quit()
+            return
+        # 录音时 33ms 一次跟上音量；其余时候 80ms 足够接住按键，待机开销更低
+        self.root.after(33 if self.hud.state == "listening" else 80, self._pump)
 
     def run(self):
         try:
             self.root.mainloop()
         finally:
+            self.tray.stop()
             if self.recognizer:
                 self.recognizer.shutdown()          # 显存跟着守护进程一起还回去
-
-
-def _last_history(n: int) -> list[str]:
-    """重启后接着用最近上屏的几句话当上下文，而不是从零开始。"""
-    if n <= 0 or not HISTORY.exists():
-        return []
-    out = []
-    for ln in HISTORY.read_text(encoding="utf-8").splitlines()[-n * 3:]:
-        try:
-            row = json.loads(ln)
-        except json.JSONDecodeError:
-            continue
-        if row.get("text") and not row.get("skipped"):
-            out.append(row["text"])
-    return out[-n:]
 
 
 def probe(seconds: int = 20):
@@ -362,6 +371,7 @@ def main():
     ap = argparse.ArgumentParser(prog="cc-voice")
     ap.add_argument("--probe", action="store_true", help="探测鼠标/键盘触发键")
     ap.add_argument("--probe-seconds", type=int, default=20)
+    ap.add_argument("--announce", action="store_true", help="启动时提示一下已启动（桌面快捷方式用）")
     args = ap.parse_args()
 
     winapi.set_dpi_aware()
@@ -373,7 +383,7 @@ def main():
         return
 
     cfg = config.load()
-    app = App(cfg)
+    app = App(cfg, announce=args.announce)
     import panel
     panel.serve(app, cfg["panel_port"])
     app.run()

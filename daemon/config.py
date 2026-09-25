@@ -16,10 +16,7 @@ DEFAULTS = {
         "port": 8379,
         "idle_minutes": 10,          # 闲置多久关掉 llama-server、释放约 1.5GB 显存
     },
-    "context": {
-        "enabled": True,
-        "recent": 10,                # 带上最近几句上屏的话，0 = 不带
-    },
+    "context": {"enabled": True},
     "trigger": {
         "mouse_button": "x2",        # x2 / x1 / middle / none
         "key": "rctrl",              # rctrl / rshift / ralt / capslock / none

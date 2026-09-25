@@ -45,6 +45,6 @@ if (Test-Running) {
 $py = Join-Path $Root '.venv\Scripts\pythonw.exe'
 $script = Join-Path $Root 'daemon\ccvoice.py'
 if ((Test-Path -LiteralPath $py) -and (Test-Path -LiteralPath $script)) {
-    Start-Process -FilePath $py -ArgumentList "`"$script`"" `
+    Start-Process -FilePath $py -ArgumentList "`"$script`" --announce" `
                   -WorkingDirectory (Join-Path $Root 'daemon') -WindowStyle Hidden
 }

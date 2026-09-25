@@ -108,9 +108,45 @@ button.danger:hover{border-color:#C9776A;box-shadow:0 2px 10px rgba(201,119,106,
 .saved{color:var(--sage);font-size:12.5px;opacity:0;transition:opacity .3s}
 .saved.on{opacity:1}
 .hint{font-size:12px;color:var(--faint);margin-top:9px;line-height:1.6}
-pre.ctx{margin:12px 0 0;padding:10px 12px;border:1px dashed var(--line);border-radius:9px;
+pre.ctx{margin:0;padding:10px 12px;border:1px dashed var(--line);border-radius:9px;
   background:var(--paper-2);color:var(--muted);font:12px/1.7 Consolas,"Microsoft YaHei UI",monospace;
-  white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto}
+  white-space:pre-wrap;word-break:break-word;height:100%;min-height:330px;max-height:430px;overflow:auto}
+pre.ctx .add{color:var(--clay)}
+
+/* 调上下文：三个字错率并排，数字越小越好 */
+.score{display:grid;grid-template-columns:repeat(3,1fr) 1.3fr;gap:12px;margin-bottom:18px;align-items:stretch}
+@media(max-width:760px){.score{grid-template-columns:1fr 1fr}}
+.sc{border:1px solid var(--line);border-radius:12px;padding:10px 14px;background:var(--card-solid)}
+.sc label{display:block}
+.sc b{font:600 24px/1.3 "Segoe UI",system-ui;font-variant-numeric:tabular-nums}
+.sc small{display:block;font-size:11.5px;color:var(--faint);min-height:17px}
+.sc.draft{border-color:var(--clay)}
+.good,.sc small.good{color:#5E8A55}.bad,.sc small.bad{color:#B4533F}
+.col{display:flex;flex-direction:column;gap:6px}
+.col textarea{min-height:120px}
+
+/* react-bits ShinyText 的纯 CSS 版：120deg 渐变、背景 200%、2s 从 150% 扫到 -50% */
+.shiny{background-image:linear-gradient(120deg,var(--muted) 0%,var(--muted) 35%,var(--clay) 50%,var(--muted) 65%,var(--muted) 100%);
+  background-size:200% auto;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+  animation:shiny 2s linear infinite}
+@keyframes shiny{from{background-position:150% center}to{background-position:-50% center}}
+
+/* 识别流水里展开的对比区 */
+.rec{flex-wrap:wrap}
+.rec .acts{flex:none;display:flex;gap:6px}
+.rec .acts button{padding:3px 10px;font-size:12px;border-radius:8px}
+.tag{display:inline-block;font-size:11px;color:#5E8A55;border:1px solid rgba(94,138,85,.35);border-radius:6px;padding:0 5px;margin-left:6px}
+.detail{flex-basis:100%;margin:10px 0 4px 17px;padding:12px 14px;border-left:2px solid var(--line)}
+.detail audio{height:32px;width:100%;max-width:420px}
+.cmp{display:grid;grid-template-columns:118px 1fr 58px;gap:6px 12px;margin:12px 0;font-size:13px;align-items:baseline}
+.cmp .k{color:var(--faint);font-size:12px}
+.cmp .v{word-break:break-word}
+.cmp .e{color:var(--faint);font-size:12px;text-align:right;font-variant-numeric:tabular-nums}
+mark{background:rgba(210,112,94,.18);color:#B4533F;border-radius:3px;padding:0 1px}
+.fixrow{display:flex;gap:8px;align-items:center}
+.fixrow input{flex:1}
+.sugg{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px}
+.sugg input{width:auto;min-width:90px;max-width:180px;padding:4px 8px}
 </style>
 </head>
 <body>
@@ -130,12 +166,47 @@ pre.ctx{margin:12px 0 0;padding:10px 12px;border:1px dashed var(--line);border-r
     <div class="hint" id="t-sessions">—</div>
   </div>
 
+  <div class="card" id="c-tune">
+    <h2>调上下文 · 改完先看效果再保存</h2>
+    <div class="score">
+      <div class="sc"><label>不带上下文</label><b id="s-none">—</b><small>字错率</small></div>
+      <div class="sc"><label>当前上下文</label><b id="s-cur">—</b><small id="s-cur-d">字错率</small></div>
+      <div class="sc draft"><label>草稿（下面还没保存的改动）</label><b id="s-draft">—</b><small id="s-draft-d">字错率</small></div>
+      <div class="col" style="justify-content:center">
+        <button id="b-eval" class="primary">用草稿跑一遍考卷</button>
+        <div class="hint" id="t-eval" style="margin:0">考卷 = 你在「最近识别」里纠正过的录音。</div>
+      </div>
+    </div>
+    <div class="two">
+      <div class="col">
+        <label class="switch"><input type="checkbox" id="f-ctx"><span class="track"><span class="knob"></span></span>识别时带上下文</label>
+        <label>我的习惯：你是谁、在做什么、常聊的话题</label>
+        <textarea id="f-context" spellcheck="false"></textarea>
+        <label>热词：专有名词，一行一个</label>
+        <textarea id="f-hot" spellcheck="false"></textarea>
+      </div>
+      <div class="col">
+        <label>实际发给模型的上下文（跟着你的输入实时变，<span style="color:var(--clay)">陶土色</span>是还没保存的）</label>
+        <pre class="ctx" id="t-ctx"></pre>
+      </div>
+    </div>
+    <div class="hint">怎么调：在下面「最近识别」里点开识别错的那条，填上本来想说的话、保存纠正 —— 这条录音就进了考卷，
+    改动的词会提成候选热词。然后改这里的习惯和热词，点「用草稿跑一遍考卷」，字错率降了就点底部「保存设置」。
+    写背景和词，不写指令：「请输出简体」这类话模型不会照做。</div>
+  </div>
+
+  <div class="card">
+    <h2>最近识别</h2>
+    <div id="t-hist"></div>
+    <div class="empty" id="t-hist-empty" style="display:none">还没有识别记录。按住触发键说句话试试。</div>
+    <div class="hint">点「对比」：听原声、看三种上下文各识别成什么、填写纠正。完整流水在 <code>logs\识别记录.log</code>。</div>
+  </div>
+
   <div class="card" id="c-cfg">
     <h2>识别与触发</h2>
     <div class="row">
       <div class="f"><label>麦克风</label><select id="f-device"></select></div>
       <div class="f"><label>闲置多久释放显存（分钟）</label><input type="number" id="f-idle" min="1" max="240"></div>
-      <div class="f"><label>上下文带上最近几句</label><input type="number" id="f-recent" min="0" max="50"></div>
     </div>
     <div class="row" style="margin-top:16px">
       <div class="f"><label>鼠标触发键</label>
@@ -166,41 +237,24 @@ pre.ctx{margin:12px 0 0;padding:10px 12px;border:1px dashed var(--line);border-r
     <div class="row" style="margin-top:16px;align-items:center">
       <label class="switch"><input type="checkbox" id="f-keyen"><span class="track"><span class="knob"></span></span>启用键盘触发</label>
       <label class="switch"><input type="checkbox" id="f-enter"><span class="track"><span class="knob"></span></span>识别后自动回车</label>
-      <label class="switch"><input type="checkbox" id="f-hud"><span class="track"><span class="knob"></span></span>显示灵动岛</label>
-      <div class="f" style="max-width:190px"><label>灵动岛不透明度 <span id="t-op"></span></label>
+      <label class="switch"><input type="checkbox" id="f-hud"><span class="track"><span class="knob"></span></span>显示浮窗</label>
+      <div class="f" style="max-width:190px"><label>浮窗不透明度 <span id="t-op"></span></label>
         <input type="range" id="f-op" min="0.4" max="1" step="0.05"></div>
       <div class="f" style="max-width:190px"><label>静音阈值 <span id="t-lv"></span></label>
         <input type="range" id="f-lv" min="0.01" max="0.15" step="0.005"></div>
     </div>
-    <div class="hint">灵动岛可以直接拖到任何位置，松手即记住；双击它就能打开本页面。<br>
+    <div class="hint">浮窗只在说话和出结果时出现，显示时可以拖动、双击打开本页面；打开面板、暂停、退出在托盘图标上。<br>
     静音阈值：录到的音量峰值低于它就判为没说话，不送识别 —— ASR 模型对噪声会硬猜出字来，
     这道闸必须在模型之前。麦克风偏灵敏就调高，说话被判成静音就调低。</div>
   </div>
 
-  <div class="card">
-    <h2>我的习惯（识别上下文）</h2>
-    <label class="switch" style="margin-bottom:12px"><input type="checkbox" id="f-ctx"><span class="track"><span class="knob"></span></span>识别时带上下文</label>
-    <textarea id="f-context" spellcheck="false"></textarea>
-    <div class="hint">写你是谁、在做什么、平时常说的话题和说法。每次识别都会连同热词表和最近几句一起交给模型，
-    它会按这些背景去猜同音字和专有名词。写背景和词，不写指令 —— 「请输出简体」这类话模型不会照做。</div>
-    <pre class="ctx" id="t-ctx"></pre>
-    <div class="hint">↑ 下一次识别实际发给模型的上下文。</div>
-  </div>
-
   <div class="two">
-    <div class="card">
-      <h2>热词表</h2>
-      <textarea id="f-hot" spellcheck="false"></textarea>
-      <div class="hint">一行一个，放专有名词。会作为上下文交给模型，模型听到读音接近的词会优先写成这里的写法。</div>
-    </div>
     <div class="card">
       <h2>替换规则</h2>
       <textarea id="f-rules" spellcheck="false"></textarea>
       <div class="hint">格式 <code>原文=&gt;替换</code>，识别完之后执行。用来修模型固定写错的词和写法偏好（比如 <code>Git Hub=&gt;GitHub</code>）。</div>
     </div>
-  </div>
-
-  <div class="card">
+    <div class="card">
     <h2>模型位置</h2>
     <div class="row">
       <div class="f" style="min-width:100%"><label>llama-server.exe</label><input type="text" id="f-llama" spellcheck="false"></div>
@@ -209,13 +263,7 @@ pre.ctx{margin:12px 0 0;padding:10px 12px;border:1px dashed var(--line);border-r
       <div class="f" style="max-width:160px"><label>端口</label><input type="number" id="f-port" min="1024" max="65535"></div>
     </div>
     <div class="hint">llama.cpp 用 Vulkan 版（AMD / NVIDIA / Intel 显卡通用）。改了这里保存后会关掉旧的 llama-server，下次按键重新加载。</div>
-  </div>
-
-  <div class="card">
-    <h2>最近识别</h2>
-    <div id="t-hist"></div>
-    <div class="empty" id="t-hist-empty" style="display:none">还没有识别记录。按住触发键说句话试试。</div>
-    <div class="hint">完整流水在 <code>logs\识别记录.log</code>，用记事本就能看。</div>
+    </div>
   </div>
 </div>
 
@@ -241,7 +289,13 @@ document.addEventListener('mousemove', e => {
   }
 });
 
-const esc = s => String(s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const post = async (url, body) => {
+  const r = await fetch(url, {method: 'POST', body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.status);
+  return j;
+};
 
 function fillSelect(el, items, value) {
   el.innerHTML = items.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join('');
@@ -273,9 +327,8 @@ async function load(fill = true) {
     ? state.sessions.map(s => `<code>${esc(s.entry)}</code> · pid ${s.pid} · ${esc(s.cwd || '—')}`).join('<br>')
     : '还没有登记到会话。用 cc / cc2 / cc3 开一个 Claude Code 窗口，插件的钩子会自动登记。';
 
-  $('#t-ctx').textContent = state.context_preview || '（未启用上下文）';
   renderHistory();
-  if (!fill) return;
+  if (!fill) { renderPreview(); return; }
 
   fillSelect($('#f-device'),
     ['系统默认', ...state.devices.map(d => d.name)],
@@ -283,7 +336,6 @@ async function load(fill = true) {
       : (state.devices.find(d => d.index === c.audio.device)?.name ?? '系统默认'));
 
   $('#f-idle').value = c.asr.idle_minutes;
-  $('#f-recent').value = c.context.recent;
   $('#f-ctx').checked = c.context.enabled;
   $('#f-llama').value = c.asr.llama_server;
   $('#f-gguf').value = c.asr.model;
@@ -303,24 +355,178 @@ async function load(fill = true) {
   $('#f-hot').value = state.hotwords;
   $('#f-rules').value = state.rules;
   $('#f-context').value = state.context;
+  renderPreview();
 }
 
+// ---------------------------------------------------------------- 上下文预览
+// 和 daemon/context.py 的 Context.build 同一个拼法；草稿里新加的行标成陶土色
+const lines = t => (t || '').split('\n').map(l => l.split('#')[0].trim()).filter(Boolean);
+
+function renderPreview() {
+  if (!state) return;
+  if (!$('#f-ctx').checked) { $('#t-ctx').textContent = '（未启用上下文，识别时不带任何参考）'; return; }
+  const savedN = new Set(lines(state.context)), savedH = new Set(lines(state.hotwords));
+  const mark = (x, saved) => saved.has(x) ? esc(x) : `<span class="add">${esc(x)}</span>`;
+  const notes = lines($('#f-context').value), hot = lines($('#f-hot').value);
+  const parts = [];
+  if (notes.length) parts.push(notes.map(x => mark(x, savedN)).join('\n'));
+  if (hot.length) parts.push('常用词：' + hot.map(x => mark(x, savedH)).join('、'));
+  $('#t-ctx').innerHTML = parts.join('\n\n') || '（空）';
+}
+for (const id of ['#f-context', '#f-hot', '#f-ctx']) $(id).addEventListener('input', renderPreview);
+
+// ---------------------------------------------------------------- 差异高亮
+// 按字做最长公共子序列，hyp 里不在公共子序列上的字标红；标点空白不算错
+function diffMarks(ref, hyp) {
+  const a = [...ref], b = [...hyp], n = a.length, m = b.length;
+  const dp = Array.from({length: n + 1}, () => new Uint16Array(m + 1));
+  for (let i = n - 1; i >= 0; i--)
+    for (let j = m - 1; j >= 0; j--)
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  let i = 0, j = 0, out = '', bad = '';
+  const flush = () => { if (bad) { out += `<mark>${esc(bad)}</mark>`; bad = ''; } };
+  while (j < m) {
+    if (i < n && a[i] === b[j]) { flush(); out += esc(b[j]); i++; j++; }
+    else if (i < n && dp[i + 1][j] >= dp[i][j + 1]) i++;
+    else { if (/[\s，。、！？,.!?；;：:]/.test(b[j])) { flush(); out += esc(b[j]); } else bad += b[j]; j++; }
+  }
+  flush();
+  return out;
+}
+
+// 字错率：去掉标点空白、英文小写后算编辑距离，和 tuning.cer 同口径
+const norm = s => (s || '').replace(/[\s，。、！？；：,.!?;:"'“”‘’（）()《》<>【】\[\]…—-]+/g, '').toLowerCase();
+function cer(ref, hyp) {
+  const a = [...norm(ref)], b = [...norm(hyp)];
+  let prev = Array.from({length: b.length + 1}, (_, k) => k);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++)
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] !== b[j - 1]));
+    prev = cur;
+  }
+  return a.length ? prev[b.length] / a.length : 0;
+}
+const pct = x => x == null ? '—' : (x * 100).toFixed(1) + '%';
+
+let histSig = '';
 function renderHistory() {
+  // 有条目展开着就不重画：轮询会把正在听的录音、正在填的纠正冲掉
+  const sig = state.history.map(h => h.id + h.ts + h.truth).join('|');
+  if (sig === histSig || document.querySelector('.detail')) return;
+  histSig = sig;
   // 列表而不是表格：识别结果长度差异很大，表格会被最长的一条撑歪，
   // 而元数据（时长/音量/耗时）本来就是次要信息，压成小字挂在后面更好扫
   const rows = state.history.map(h => `
-    <div class="rec${h.skipped ? ' skip' : ''}">
+    <div class="rec${h.skipped ? ' skip' : ''}" data-id="${esc(h.id || '')}">
       <i class="dot ${h.skipped ? '' : 'ok'}"></i>
       <time>${esc(h.ts.slice(11))}</time>
-      <div class="say">${esc(h.skipped || h.text)}${
-        h.raw && h.raw !== h.text && !h.skipped
-          ? `<em>原始：${esc(h.raw)}</em>` : ''}</div>
+      <div class="say">${esc(h.truth || h.skipped || h.text)}${h.truth ? '<span class="tag">已纠正</span>' : ''}${
+        h.truth && h.truth !== h.text ? `<em>识别成：${esc(h.text || h.raw)}</em>`
+        : h.raw && h.raw !== h.text && !h.skipped ? `<em>原始：${esc(h.raw)}</em>` : ''}</div>
       <div class="meta">${h.audio_s ?? '—'}s · ${h.peak ?? '—'}${
         h.infer_ms ? ' · ' + h.infer_ms + 'ms' : ''}</div>
+      ${h.has_audio ? '<div class="acts"><button data-act="cmp">对比</button></div>' : ''}
     </div>`).join('');
   $('#t-hist').innerHTML = rows;
   $('#t-hist-empty').style.display = rows ? 'none' : 'block';
 }
+
+$('#t-hist').addEventListener('click', async e => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  const rec = btn.closest('.rec'), id = rec.dataset.id;
+  const h = state.history.find(x => x.id === id);
+  if (btn.dataset.act === 'cmp') {
+    const open = rec.querySelector('.detail');
+    if (open) { open.remove(); btn.textContent = '对比'; return; }
+    btn.textContent = '收起';
+    rec.insertAdjacentHTML('beforeend', `
+      <div class="detail">
+        <audio controls preload="none" src="/api/audio/${esc(id)}.wav"></audio>
+        <div class="cmp"></div>
+        <div class="fixrow">
+          <input type="text" class="truth" value="${esc(h.truth || h.text || h.raw)}" placeholder="本来想说的话">
+          <button data-act="fix">保存纠正</button>
+          <button data-act="retry">用草稿重新识别</button>
+        </div>
+        <div class="sugg"></div>
+      </div>`);
+    return retry(rec, h);
+  }
+  if (btn.dataset.act === 'retry') return retry(rec, h);
+  if (btn.dataset.act === 'fix') {
+    const truth = rec.querySelector('.truth').value.trim();
+    const r = await post('/api/correct', {id, truth});
+    h.truth = truth;
+    const box = rec.querySelector('.sugg');
+    box.innerHTML = r.suggest.length
+      ? '<span class="k" style="color:var(--faint);font-size:12px">候选热词（可改）：</span>' +
+        r.suggest.map(w => `<input type="text" value="${esc(w)}">`).join('') +
+        '<button data-act="addhot">加入热词</button>'
+      : '<span class="hint" style="margin:0">已存进考卷。没有需要加的热词。</span>';
+    return retry(rec, h);
+  }
+  if (btn.dataset.act === 'addhot') {
+    const words = [...rec.querySelectorAll('.sugg input')].map(x => x.value.trim()).filter(Boolean);
+    const r = await post('/api/hotwords/add', {words});
+    if (r.added.length) {
+      $('#f-hot').value = $('#f-hot').value.replace(/\n*$/, '\n') + r.added.join('\n') + '\n';
+      state.hotwords = $('#f-hot').value;
+      renderPreview();
+    }
+    rec.querySelector('.sugg').innerHTML =
+      `<span class="hint" style="margin:0">已加入热词：${esc(r.added.join('、') || '（都已存在）')}</span>`;
+  }
+});
+
+async function retry(rec, h) {
+  const box = rec.querySelector('.cmp');
+  box.innerHTML = '<span class="shiny" style="grid-column:1/-1">正在用三种上下文重新识别…</span>';
+  let r;
+  try {
+    r = await post('/api/retry', {id: h.id, notes: $('#f-context').value, hotwords: $('#f-hot').value});
+  } catch (err) {
+    box.innerHTML = `<span class="bad" style="grid-column:1/-1">${esc(err.message)}</span>`;
+    return;
+  }
+  const truth = r.truth;
+  // 没纠正过就拿「当前上下文」的结果当参照，标出上下文改变了哪些字
+  const ref = truth || r.current;
+  const row = (k, v) => `<div class="k">${k}</div><div class="v">${
+    v == null ? '<span style="color:var(--faint)">和当前一样（草稿没改动）</span>' : diffMarks(ref, v)}</div>
+    <div class="e">${truth && v != null ? pct(cer(truth, v)) : ''}</div>`;
+  box.innerHTML = (truth ? `<div class="k">本来想说</div><div class="v">${esc(truth)}</div><div class="e">字错率</div>` : '')
+    + row('不带上下文', r.none) + row('当前上下文', r.current) + row('草稿上下文', r.draft);
+}
+
+// ---------------------------------------------------------------- 考卷
+$('#b-eval').addEventListener('click', async () => {
+  const b = $('#b-eval');
+  b.disabled = true;
+  $('#t-eval').innerHTML = '<span class="shiny">正在把考卷里的录音各识别三遍…</span>';
+  try {
+    const r = await post('/api/eval', {notes: $('#f-context').value, hotwords: $('#f-hot').value});
+    const c = r.cer;
+    $('#s-none').textContent = pct(c.none);
+    $('#s-cur').textContent = pct(c.current);
+    $('#s-draft').textContent = pct(c.draft);
+    const delta = (x, base, el, label) => {
+      if (x == null || base == null) { el.textContent = '字错率'; el.className = ''; return; }
+      const d = (x - base) * 100;
+      el.textContent = Math.abs(d) < 0.05 ? `和${label}一样` : `比${label}${d < 0 ? '少' : '多'} ${Math.abs(d).toFixed(1)} 个点`;
+      el.className = d < -0.05 ? 'good' : d > 0.05 ? 'bad' : '';
+    };
+    delta(c.current, c.none, $('#s-cur-d'), '不带');
+    delta(c.draft, c.current, $('#s-draft-d'), '当前');
+    $('#t-eval').textContent = r.items.length
+      ? `考卷 ${r.items.length} 条。草稿更好就点底部「保存设置」。`
+      : '还没有考卷：先在「最近识别」里点开几条，保存纠正。';
+  } catch (err) {
+    $('#t-eval').innerHTML = `<span class="bad">${esc(err.message)}</span>`;
+  }
+  b.disabled = false;
+});
 
 $('#f-op').addEventListener('input', e =>
   $('#t-op').textContent = Math.round(e.target.value * 100) + '%');
@@ -343,7 +549,6 @@ $('#b-save').addEventListener('click', async () => {
     idle_minutes: +$('#f-idle').value,
   });
   cfg.context.enabled = $('#f-ctx').checked;
-  cfg.context.recent = +$('#f-recent').value;
   cfg.trigger.mouse_button = $('#f-mouse').value;
   cfg.trigger.key = $('#f-key').value;
   cfg.trigger.key_enabled = $('#f-keyen').checked;
@@ -373,7 +578,7 @@ $('#b-quit').addEventListener('click', async () => {
   document.body.innerHTML =
     '<div style="max-width:940px;margin:120px auto;text-align:center;color:#7E776B">' +
     '<h1 style="color:#332F29">已退出</h1>' +
-    '<p>灵动岛已关闭，语音输入停止。<br>' +
+    '<p>浮窗已关闭，语音输入停止。<br>' +
     '要再打开，双击桌面上的「语音输入」即可。</p></div>';
 });
 

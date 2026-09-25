@@ -89,6 +89,9 @@ class SessionGate:
         """
         def loop():
             while True:
+                if self.mode == "always":          # 全局模式用不上进程树，别白扫
+                    time.sleep(1.0)
+                    continue
                 try:
                     self.refresh(force=True)
                 except Exception:
