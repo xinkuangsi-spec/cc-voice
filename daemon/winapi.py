@@ -55,6 +55,25 @@ def foreground_title() -> str:
     return buf.value
 
 
+# ------------------------------------------------------------- 繁转简
+# Qwen3-ASR 没有简繁开关，偶尔整句答成繁体。繁简基本一一对应，Windows 自带的
+# 逐字映射就够用，英文原样不动，省掉一个 opencc 依赖。
+LCMAP_SIMPLIFIED_CHINESE = 0x02000000
+kernel32.LCMapStringEx.restype  = ctypes.c_int
+kernel32.LCMapStringEx.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.LPCWSTR,
+                                   ctypes.c_int, wintypes.LPWSTR, ctypes.c_int,
+                                   ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+
+
+def to_simplified(text: str) -> str:
+    if not text:
+        return text
+    buf = ctypes.create_unicode_buffer(len(text) * 2 + 1)
+    n = kernel32.LCMapStringEx("zh-CN", LCMAP_SIMPLIFIED_CHINESE, text, len(text),
+                               buf, len(buf), None, None, None)
+    return buf.value[:n] if n > 0 else text
+
+
 # ------------------------------------------------------------- 剪贴板
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE  = 0x0002

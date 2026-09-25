@@ -34,6 +34,7 @@ def _tlog(msg: str) -> None:
 
 
 MOUSE_BUTTONS = {"x1": winapi.XBUTTON1, "x2": winapi.XBUTTON2}
+VK_ESCAPE = 0x1B
 KEYS = {"rctrl": 0xA3, "rshift": 0xA1, "ralt": 0xA5, "capslock": 0x14,
         "f2": 0x71, "f4": 0x73}
 
@@ -47,13 +48,16 @@ class Trigger(threading.Thread):
 
     daemon = True
 
-    def __init__(self, cfg: dict, gate, on_down, on_up, probe=None, island=None):
+    def __init__(self, cfg: dict, gate, on_down, on_up, probe=None, island=None,
+                 on_cancel=None):
         super().__init__(name="trigger")
         self.cfg, self.gate = cfg, gate
         self.on_down, self.on_up, self.probe = on_down, on_up, probe
+        self.on_cancel = on_cancel        # Esc：返回 True 表示接管了这个键
         self.island = island              # 灵动岛：hit_test / move_by / finish_move
         self._stop = threading.Event()
         self._held = False
+        self._eat_up = False              # Esc 取消后，触发键的松开也要吞掉
         self._hooks = []
         self._drag_from = None
         self._last_click = 0.0
@@ -134,12 +138,18 @@ class Trigger(threading.Thread):
 
     def _key(self, n_code, w_param, l_param):
         tr = self.cfg["trigger"]
-        if not tr.get("key_enabled"):
-            return False
-        want = KEYS.get(tr.get("key", "rctrl"))
         info = ctypes.cast(l_param, ctypes.POINTER(winapi.KBDLLHOOKSTRUCT)).contents
         down = w_param in (winapi.WM_KEYDOWN, winapi.WM_SYSKEYDOWN)
         up = w_param in (winapi.WM_KEYUP, winapi.WM_SYSKEYUP)
+        if info.vkCode == VK_ESCAPE and self.on_cancel and not self.probe:
+            if down and self.on_cancel():
+                if self._held:
+                    self._held, self._eat_up = False, True
+                return True
+            return False
+        if not tr.get("key_enabled"):
+            return False
+        want = KEYS.get(tr.get("key", "rctrl"))
         if self.probe and (down or up):
             self.probe(f"key vk=0x{info.vkCode:02X} {'down' if down else 'up'}")
         if want and info.vkCode == want:
@@ -150,6 +160,9 @@ class Trigger(threading.Thread):
         return False
 
     def _edge(self, down: bool) -> bool:
+        if not down and self._eat_up:
+            self._eat_up = False
+            return True
         if down:
             if self._held:
                 return True

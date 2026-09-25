@@ -1,49 +1,29 @@
+# 下载 Qwen3-ASR-1.7B 的 GGUF（模型 2.1GB + mmproj 0.35GB）。已存在的文件跳过。
+# 目录和 daemon/config.py 的默认值一致；放别处就传 -Dir，再到管理面板里改路径。
+#
+# llama.cpp 不在这里下：去 https://github.com/ggml-org/llama.cpp/releases 取 Windows
+# Vulkan 版，解压后把 llama-server.exe 的路径填进管理面板（默认 D:\models\llama.cpp\bin）。
+param([string]$Dir = 'D:\models\qwen3-asr-1.7b')
 $ErrorActionPreference = 'Stop'
-$root   = Split-Path -Parent $PSScriptRoot
-$models = Join-Path $root "models"
-$tmp    = Join-Path $root "models\_dl"
-New-Item -ItemType Directory -Force -Path $models, $tmp | Out-Null
+New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 
-# GitHub releases 在本机 PowerShell 可直连；ghproxy 作为降级镜像（§5 fallback）
+# 魔搭在国内快；Hugging Face 兜底
 $bases = @(
-  "https://github.com/k2-fsa/sherpa-onnx/releases/download",
-  "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download"
+  'https://modelscope.cn/models/ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/master',
+  'https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/main'
 )
 
-$items = @(
-  @{ tag='asr-models'; file='sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09.tar.bz2'; dir='sense-voice' },
-  @{ tag='asr-models'; file='sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17.tar.bz2';     dir='funasr-nano' },
-  @{ tag='asr-models'; file='silero_vad.onnx';                                                 dir=$null }
-)
-
-foreach ($it in $items) {
-  $dest = Join-Path $tmp $it.file
-  if (Test-Path $dest) { Write-Host "[skip-dl] $($it.file)"; }
-  else {
-    $ok = $false
-    foreach ($b in $bases) {
-      $url = "$b/$($it.tag)/$($it.file)"
-      try {
-        Write-Host "[get] $url"
-        & curl.exe -L --fail --retry 2 --connect-timeout 20 -o "$dest" "$url"
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $dest)) { $ok = $true; break }
-      } catch { Write-Host "[warn] $($_.Exception.Message)" }
-    }
-    if (-not $ok) { throw "download failed: $($it.file)" }
+foreach ($file in 'Qwen3-ASR-1.7B-Q8_0.gguf', 'mmproj-Qwen3-ASR-1.7B-Q8_0.gguf') {
+  $dest = Join-Path $Dir $file
+  if (Test-Path $dest) { Write-Host "[skip] $dest"; continue }
+  $ok = $false
+  foreach ($b in $bases) {
+    Write-Host "[get] $b/$file"
+    # 先写 .part，下完再改名：半截文件不会被当成已下载而跳过
+    & curl.exe -L --fail --retry 2 --connect-timeout 20 -C - -o "$dest.part" "$b/$file"
+    if ($LASTEXITCODE -eq 0) { Move-Item -Force "$dest.part" $dest; $ok = $true; break }
   }
-
-  if ($it.dir) {
-    $target = Join-Path $models $it.dir
-    if (Test-Path (Join-Path $target 'model.int8.onnx')) { Write-Host "[skip-ex] $($it.dir)"; continue }
-    New-Item -ItemType Directory -Force -Path $target | Out-Null
-    Write-Host "[extract] $($it.file) -> $target"
-    & tar.exe -xjf "$dest" -C "$target" --strip-components=1
-    if ($LASTEXITCODE -ne 0) { throw "extract failed: $($it.file)" }
-  } else {
-    Copy-Item $dest (Join-Path $models $it.file) -Force
-  }
+  if (-not $ok) { throw "download failed: $file" }
 }
-Write-Host "[done] models ready"
-Get-ChildItem $models -Recurse -File | Where-Object { $_.Length -gt 100KB } |
-  Select-Object @{n='path';e={$_.FullName.Replace($models,'')}}, @{n='MB';e={[math]::Round($_.Length/1MB,1)}} |
-  Format-Table -AutoSize
+Get-ChildItem $Dir -Filter *.gguf |
+  Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB)}} | Format-Table -AutoSize

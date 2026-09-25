@@ -6,15 +6,26 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG_FILE = ROOT / "config.json"
 
 DEFAULTS = {
-    "model": "funasr-nano",          # 基准实测 CER 2.1%，优于 sense-voice 的 6.1%
-    "num_threads": 4,
-    "language": "auto",              # 中英混说时 auto 比钉死 zh 更准
+    # Qwen3-ASR-1.7B 跑在 llama.cpp 上。模型和 llama.cpp 都不在仓库里，
+    # 放在别处就在 config.json 或管理面板里改路径。
+    "asr": {
+        "llama_server": "D:/models/llama.cpp/bin/llama-server.exe",
+        "model": "D:/models/qwen3-asr-1.7b/Qwen3-ASR-1.7B-Q8_0.gguf",
+        "mmproj": "D:/models/qwen3-asr-1.7b/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf",
+        # 不和 voice-dictate 的 8378 共用：它启动时会按端口清理残留的 llama-server
+        "port": 8379,
+        "idle_minutes": 10,          # 闲置多久关掉 llama-server、释放约 1.5GB 显存
+    },
+    "context": {
+        "enabled": True,
+        "recent": 10,                # 带上最近几句上屏的话，0 = 不带
+    },
     "trigger": {
         "mouse_button": "x2",        # x2 / x1 / middle / none
         "key": "rctrl",              # rctrl / rshift / ralt / capslock / none
         "key_enabled": True,         # 鼠标没侧键时的兜底，实测可用后可关
     },
-    "gate_mode": "claude_only",      # claude_only / always
+    "gate_mode": "always",           # always / claude_only
     "inject": {
         "method": "ctrl_v",          # ctrl_v / shift_insert
         "auto_enter": False,         # 识别完是否直接回车发送
@@ -49,7 +60,7 @@ def load() -> dict:
             return _merge(DEFAULTS, json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
             pass                      # 配置损坏时退回默认值，别让守护进程起不来
-    return dict(DEFAULTS)
+    return json.loads(json.dumps(DEFAULTS))   # 深拷贝：别让运行时改动污染默认值
 
 
 def save(cfg: dict) -> None:

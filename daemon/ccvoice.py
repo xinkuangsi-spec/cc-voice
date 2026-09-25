@@ -1,4 +1,4 @@
-"""cc-voice 守护进程：按住触发键说话，松开把中文上屏到 Claude Code 终端。
+"""cc-voice 守护进程：按住触发键说话，松开把中文上屏到前台窗口。
 
 线程分工（低级钩子与 tkinter 各自需要不同的事件循环，无法合并）：
   主线程     tkinter mainloop —— 只画 HUD，绝不做阻塞操作
@@ -25,6 +25,7 @@ import audio
 import config
 import inject
 import winapi
+from context import Context
 from gate import SessionGate
 from hud import Hud
 from textfix import TextFixer
@@ -68,7 +69,13 @@ class App:
         LOGS.mkdir(parents=True, exist_ok=True)
         self.gate = SessionGate(ROOT / "sessions", cfg["gate_mode"])
         self.gate.start()                    # 后台每秒重扫进程树，见 gate.start()
-        self.fixer = TextFixer(ROOT / "hotwords.txt", ROOT / "rules.txt")
+        self.fixer = TextFixer(ROOT / "rules.txt")
+        self.context = Context(ROOT / "context.txt", ROOT / "hotwords.txt",
+                               cfg["context"]["recent"])
+        for row in _last_history(cfg["context"]["recent"]):
+            self.context.remember(row)
+        self.last_context = ""
+        self._cancel = False
         self.recorder = audio.Recorder(device=cfg["audio"]["device"])
         self.cmd_q: queue.Queue = queue.Queue()      # 钩子线程 -> worker
         self.ui_q: queue.Queue = queue.Queue()       # worker -> tkinter 主线程
@@ -91,7 +98,7 @@ class App:
         self.trigger = Trigger(cfg, self._gate,
                                lambda: self.cmd_q.put("down"),
                                lambda: self.cmd_q.put("up"),
-                               island=self.hud)
+                               island=self.hud, on_cancel=self._request_cancel)
         self.trigger.start()
         threading.Thread(target=self._worker, name="worker", daemon=True).start()
         self.root.after(30, self._pump)
@@ -123,21 +130,23 @@ class App:
 
     # -------------------------------------------------------------- 模型
     def reload_model(self):
-        """面板换模型后热切换。旧识别器留给正在进行的请求，由 GC 回收。"""
-        self.recognizer, self.rec_error = None, None
+        """面板改了模型路径/端口后重建识别器。旧的 llama-server 先关掉，
+        否则它会一直占着显存和端口。"""
+        old, self.recognizer, self.rec_error = self.recognizer, None, None
+        if old:
+            old.shutdown()
         threading.Thread(target=self._load_model, name="model", daemon=True).start()
 
     def _load_model(self):
+        """只校验文件和清理残留进程；真正加载在第一次按键时，见 asr.warm()。"""
         from asr import Recognizer
         try:
-            self.status = "加载模型"
-            self.recognizer = Recognizer(ROOT / "models" / self.cfg["model"],
-                                         num_threads=self.cfg["num_threads"],
-                                         language=self.cfg["language"])
+            self.status = "检查模型"
+            self.recognizer = Recognizer(self.cfg["asr"])
             self.status = "就绪"
         except Exception as e:                     # 模型缺失/损坏要在面板里看得见
             self.rec_error = f"{type(e).__name__}: {e}"
-            self.status = "模型加载失败"
+            self.status = "模型不可用"
 
     # ------------------------------------------------------- 录音/识别
     def _worker(self):
@@ -148,15 +157,34 @@ class App:
                     self._begin()
                 elif cmd == "up":
                     self._finish()
+                elif cmd == "cancel":
+                    self._abort()
             except Exception as e:
-                self._ui("blocked", f"出错：{type(e).__name__}")
+                self._record(0, 0, skipped=f"出错：{type(e).__name__}: {e}")
+                self._ui("blocked", f"出错：{type(e).__name__}", hide_after=1500)
+
+    def _request_cancel(self) -> bool:
+        """由钩子线程调用（Esc）：录音中或识别中才接管这个键，否则原样放行。"""
+        if not (self.recorder.recording or self.hud.state == "thinking"):
+            return False
+        self._cancel = True
+        self.cmd_q.put("cancel")
+        return True
+
+    def _abort(self):
+        if self.recorder.recording:
+            self.recorder.stop()
+            self._cancel = False
+        self._ui("blocked", "已取消", hide_after=700)
 
     def _begin(self):
         if self.recognizer is None:
             self._ui("blocked", self.rec_error and "模型加载失败" or "模型加载中…")
             return
         self.record_t0 = time.time()
+        self._cancel = False
         self.recorder.start()
+        self.recognizer.warm()                     # 模型加载藏在录音时间里
         self._ui("listening", "0:00")
 
     def _finish(self):
@@ -178,8 +206,14 @@ class App:
             return
 
         self._ui("thinking")
-        raw, ms = self.recognizer.transcribe(samples)
+        ctx = self.context.build() if self.cfg["context"]["enabled"] else ""
+        self.last_context = ctx
+        _, raw, ms = self.recognizer.transcribe(samples, ctx)
         text = self.fixer.apply(raw)
+        if self._cancel:                           # 识别途中按了 Esc：结果作废
+            self._cancel = False
+            self._record(dur, peak, raw=raw, ms=ms, skipped="已取消")
+            return
         if not text:
             self._record(dur, peak, raw=raw, ms=ms, skipped="没有识别到内容")
             self._ui("blocked", "没有识别到内容", hide_after=900)
@@ -189,6 +223,7 @@ class App:
                           self.cfg["inject"]["restore_clipboard_ms"],
                           self.cfg["inject"]["auto_enter"])
         self._record(dur, peak, raw=raw, text=text, ms=ms)
+        self.context.remember(text)
         self._ui("done", text, hide_after=self.cfg["hud"]["done_ms"])
 
     def _record(self, dur, peak, raw="", text="", ms=0.0, skipped=""):
@@ -278,7 +313,26 @@ class App:
         self.root.after(33, self._pump)
 
     def run(self):
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            if self.recognizer:
+                self.recognizer.shutdown()          # 显存跟着守护进程一起还回去
+
+
+def _last_history(n: int) -> list[str]:
+    """重启后接着用最近上屏的几句话当上下文，而不是从零开始。"""
+    if n <= 0 or not HISTORY.exists():
+        return []
+    out = []
+    for ln in HISTORY.read_text(encoding="utf-8").splitlines()[-n * 3:]:
+        try:
+            row = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        if row.get("text") and not row.get("skipped"):
+            out.append(row["text"])
+    return out[-n:]
 
 
 def probe(seconds: int = 20):

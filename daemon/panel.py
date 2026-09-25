@@ -51,20 +51,21 @@ def make_handler(app):
                 return self._send(200, _read(WEB / "index.html"),
                                   "text/html; charset=utf-8")
             if self.path == "/api/state":
-                models = sorted(p.name for p in (ROOT / "models").iterdir()
-                                if p.is_dir() and not p.name.startswith("_"))
                 return self._send(200, json.dumps({
                     "status": app.status,
                     "paused": app.paused,
                     "error": app.rec_error,
                     "config": app.cfg,
-                    "models": models,
+                    "asr_loaded": bool(app.recognizer and app.recognizer.loaded),
                     "devices": audio.list_devices(),
                     "stats": app.stats,
                     "sessions": [{"pid": s.get("claude_pid"), "entry": s.get("entry"),
                                   "cwd": s.get("cwd")} for s in app.gate.sessions()],
                     "hotwords": _read(ROOT / "hotwords.txt"),
                     "rules": _read(ROOT / "rules.txt"),
+                    "context": _read(ROOT / "context.txt"),
+                    # 下一次识别会发给模型的上下文，所见即所得
+                    "context_preview": app.context.build() if app.cfg["context"]["enabled"] else "",
                     "history": _tail_history(),
                 }, ensure_ascii=False))
             return self._send(404, "{}")
@@ -73,12 +74,13 @@ def make_handler(app):
             n = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(n) or "{}")
             if self.path == "/api/config":
-                changed_model = body.get("model") != app.cfg.get("model")
+                changed_asr = body.get("asr") != app.cfg.get("asr")
                 app.cfg.update(body)
                 config.save(app.cfg)
                 app.gate.mode = app.cfg["gate_mode"]
                 app.recorder.device = app.cfg["audio"]["device"]
-                if changed_model:
+                app.context.resize(app.cfg["context"]["recent"])
+                if changed_asr:
                     app.reload_model()
                 return self._send(200, json.dumps({"ok": True}))
             if self.path == "/api/control":
@@ -91,7 +93,9 @@ def make_handler(app):
             if self.path == "/api/text":
                 (ROOT / "hotwords.txt").write_text(body.get("hotwords", ""), encoding="utf-8")
                 (ROOT / "rules.txt").write_text(body.get("rules", ""), encoding="utf-8")
+                (ROOT / "context.txt").write_text(body.get("context", ""), encoding="utf-8")
                 app.fixer.reload()
+                app.context.reload()
                 return self._send(200, json.dumps({"ok": True}))
             return self._send(404, "{}")
 
