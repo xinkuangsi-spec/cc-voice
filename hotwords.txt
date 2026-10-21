@@ -45,3 +45,21 @@ cc-voice
 项目大脑
 工作流
 节点
+DeepSeek Harness
+CLAUDE.md
+video-shotcraft
+Muse
+agy
+opencode
+qlink
+Grokbot
+OpenManus
+SWE-2
+AI-workspace
+Anthropic
+会话
+密钥
+CLI
+待办
+线程
+子 agent
