@@ -75,6 +75,7 @@ class App:
         self.context = Context(ROOT / "context.txt", ROOT / "hotwords.txt")
         self.last_context = ""
         self._cancel = False
+        self._last_paste = (0.0, None, "")   # (时间, 前台窗口, 末字)：判断这一段是不是接着上一段说
         self.recorder = audio.Recorder(device=cfg["audio"]["device"])
         self.cmd_q: queue.Queue = queue.Queue()      # 钩子线程 -> worker
         self.ui_q: queue.Queue = queue.Queue()       # worker -> tkinter 主线程
@@ -237,6 +238,15 @@ class App:
             self._record(dur, peak, raw=raw, ms=ms, skipped="没有识别到内容", rid=rid)
             self._ui("blocked", "没有识别到内容", hide_after=900)
             return
+
+        # 一句话常分几次按键说完，模型给每段都收个句号，句号就落在句子中间。
+        # 所以段尾句号不上屏；同一窗口 20 秒内接着说的，用逗号接上。问号叹号照留。
+        text = text.rstrip("。.") or text
+        hwnd = winapi.user32.GetForegroundWindow()
+        last_t, last_hwnd, last_end = self._last_paste
+        if hwnd == last_hwnd and time.time() - last_t < 20 and last_end not in "？！?!，,":
+            text = "，" + text
+        self._last_paste = (time.time(), hwnd, text[-1])
 
         inject.paste_text(text, self.cfg["inject"]["method"],
                           self.cfg["inject"]["restore_clipboard_ms"],
